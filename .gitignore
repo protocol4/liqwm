@@ -1,0 +1,9 @@
+/build/
+*.o
+*.a
+*.so
+liqwm
+standalone_test
+link_test
+compile_commands.json
+.cache/
