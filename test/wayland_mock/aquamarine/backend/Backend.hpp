@@ -8,6 +8,7 @@
 #include <any>
 #include <hyprutils/memory/SharedPtr.hpp>
 #include <hyprutils/signal/Signal.hpp>
+#include "../allocator/Allocator.hpp"
 
 namespace Aquamarine {
 
@@ -18,6 +19,19 @@ namespace Aquamarine {
 class IOutput;
 class IPointer;
 class IKeyboard;
+
+// Real IBackendImplementation has many more pure virtuals (start, type,
+// pollFDs, etc) -- only preferredAllocator() is given a body here since
+// that's the only method our own code actually calls through this type.
+// Not abstract in this mock purely so it's instantiable for testing;
+// the real one is.
+class IBackendImplementation {
+public:
+    virtual ~IBackendImplementation() = default;
+    virtual Hyprutils::Memory::CSharedPointer<IAllocator> preferredAllocator() {
+        return Hyprutils::Memory::CSharedPointer<IAllocator>(nullptr);
+    }
+};
 
 enum eBackendType : uint32_t {
     AQ_BACKEND_WAYLAND = 0,

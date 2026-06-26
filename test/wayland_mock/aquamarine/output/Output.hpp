@@ -1,38 +1,59 @@
-// CONFIRMED by the user's actual build: the access path
-// output->name / output->state->state().mode->pixelSize.{x,y} compiles
-// fine against the real Aquamarine 0.12.1 headers (their build got past
-// these lines with zero complaints), so -- unlike the IPointer case --
-// this guess turned out to be right. Kept as a placeholder shape rather
-// than pulling in the real Output.hpp, since there was nothing to fix.
+// CONFIRMED against the user's real /usr/include/aquamarine/output/Output.hpp
+// (0.12.1) -- this is no longer a placeholder. Trimmed to just what
+// Compositor.cpp actually uses.
 #pragma once
 #include "../backend/Backend.hpp"
+#include "../allocator/Swapchain.hpp"
 #include <hyprutils/signal/Signal.hpp>
+#include <hyprutils/memory/WeakPtr.hpp>
+#include <hyprutils/math/Vector2D.hpp>
+#include <drm_fourcc.h>
 #include <string>
 
 namespace Aquamarine {
 
-struct Vector2D {
-    double x = 0;
-    double y = 0;
-};
-
 struct SOutputMode {
-    Vector2D pixelSize;
+    Hyprutils::Math::Vector2D pixelSize;
+    unsigned int refreshRate = 0;
+    bool preferred = false;
 };
 
-struct SOutputState {
-    SOutputMode* mode = nullptr;
-};
+class IOutput;
 
-class IOutputStateHolder {
+class COutputState {
 public:
-    SOutputState state() const { return {}; }
+    struct SInternalState {
+        Hyprutils::Memory::CWeakPointer<SOutputMode> mode;
+        uint32_t drmFormat = 0;
+        Hyprutils::Memory::CSharedPointer<IBuffer> buffer;
+    };
+
+    const SInternalState& state() { return internalState_; }
+    void setEnabled(bool) {}
+    void setMode(Hyprutils::Memory::CSharedPointer<SOutputMode> m) { modeOwner_ = m; internalState_.mode = m.get(); }
+    void setBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> b) { internalState_.buffer = b; }
+    void setFormat(uint32_t fmt) { internalState_.drmFormat = fmt; }
+
+private:
+    SInternalState internalState_;
+    Hyprutils::Memory::CSharedPointer<SOutputMode> modeOwner_; // keeps the mode alive for the weak ptr above, mock-only detail
 };
 
 class IOutput {
 public:
+    virtual ~IOutput() = default;
+
+    virtual bool commit() = 0;
+    virtual Hyprutils::Memory::CSharedPointer<IBackendImplementation> getBackend() = 0;
+    virtual Hyprutils::Memory::CSharedPointer<SOutputMode> preferredMode() {
+        return Hyprutils::Memory::CSharedPointer<SOutputMode>(nullptr); // mock: no real mode to offer
+    }
+
     std::string name;
-    IOutputStateHolder* state = nullptr;
+    Hyprutils::Memory::CSharedPointer<COutputState> state =
+        Hyprutils::Memory::CSharedPointer<COutputState>(new COutputState());
+    Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain;
+
     struct {
         Hyprutils::Signal::CSignalT<> frame;
     } events;

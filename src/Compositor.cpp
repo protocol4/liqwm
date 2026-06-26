@@ -213,13 +213,39 @@ void Compositor::initBackend() {
 }
 
 void Compositor::onNewOutput(SP<Aquamarine::IOutput> output) {
+    // CONFIRMED against the real Output.hpp: an output does nothing until
+    // you enable it and give it a mode via setters on output->state, then
+    // commit(). Doing this BEFORE reading state().mode for the Monitor's
+    // resolution (unlike the old code, which read it first and always
+    // hit the 1920x1080 fallback since nothing had set a mode yet).
+    output->state->setEnabled(true);
+    if (auto mode = output->preferredMode()) {
+        output->state->setMode(mode);
+    }
+    if (!output->commit()) {
+        std::cerr << "onNewOutput: initial commit (enable+mode) failed for \"" << output->name << "\"\n";
+    }
+
     Monitor mon;
     mon.name = output->name;
     mon.resolution = {
-        static_cast<double>(output->state->state().mode ? output->state->state().mode->pixelSize.x : 1920),
-        static_cast<double>(output->state->state().mode ? output->state->state().mode->pixelSize.y : 1080)
+        output->state->state().mode ? output->state->state().mode->pixelSize.x : 1920,
+        output->state->state().mode ? output->state->state().mode->pixelSize.y : 1080
     };
     monitors_.push_back(mon);
+
+    // Set up somewhere to actually render into. CONFIRMED shape:
+    // CSwapchain::create(allocator, backendImpl), reconfigure() with
+    // scanout=true (this is what actually reaches the screen, not an
+    // offscreen buffer). `swapchain` is a public field directly on
+    // IOutput, no separate storage needed on our side.
+    auto allocator = output->getBackend()->preferredAllocator();
+    output->swapchain = Aquamarine::CSwapchain::create(allocator, output->getBackend());
+
+    Aquamarine::SSwapchainOptions swapchainOpts;
+    swapchainOpts.size = {mon.resolution.x, mon.resolution.y};
+    swapchainOpts.scanout = true;
+    output->swapchain->reconfigure(swapchainOpts);
 
     signalListeners_.push_back(output->events.frame.registerListener([this, output](std::any) {
         renderFrame(*output);
@@ -273,20 +299,116 @@ void Compositor::registerKeybinds() {
 }
 
 void Compositor::renderFrame(Aquamarine::IOutput& output) {
-    // Real build: acquire a render buffer from `output`, then for each
-    // mapped window compute screen rect via camera_.worldToScreen(...)
-    // and blit/draw its surface texture there, then output.commit().
-    //
-    // Pseudocode:
-    //
-    // Vec2 viewport = monitorResolutionFor(output);
-    // for (auto& w : windows_) {
-    //     if (!w.mapped) continue;
-    //     Vec2 screenPos = camera_.worldToScreen(w.worldPosition, viewport);
-    //     Vec2 screenSize = w.size * camera_.zoom;
-    //     // skip windows fully outside viewport (frustum cull)
-    //     // draw w.surface at {screenPos, screenSize}
-    // }
+    if (!output.swapchain) return; // not set up yet (shouldn't happen -- onNewOutput always creates one)
+
+    int age = 0;
+    auto buffer = output.swapchain->next(&age);
+    if (!buffer) {
+        std::cerr << "renderFrame: swapchain has no buffer available\n";
+        return;
+    }
+
+    // CONFIRMED: not every buffer is CPU-writable (GPU-tiled/compressed
+    // ones aren't). This is exactly the GBM-vs-DRM_DUMB allocator split
+    // from Allocator.hpp -- a DRM_DUMB-backed buffer should have this
+    // capability; a GBM one might not, depending on modifiers. If this
+    // branch is hit constantly, that's the real next thing to solve (a
+    // GL/EGL render path), not something to paper over here.
+    if (!(buffer->caps() & Aquamarine::BUFFER_CAPABILITY_DATAPTR)) {
+        std::cerr << "renderFrame: buffer has no CPU data pointer (GPU-only render path not implemented yet)\n";
+        return;
+    }
+
+    auto [data, format, byteSize] = buffer->beginDataPtr(0);
+    if (!data) {
+        std::cerr << "renderFrame: beginDataPtr returned null\n";
+        return;
+    }
+
+    const int width = static_cast<int>(buffer->size.x);
+    const int height = static_cast<int>(buffer->size.y);
+
+    // bpp/byte-order: CONFIRMED correct for XRGB8888/ARGB8888 specifically
+    // (drm_fourcc.h's own comment: "[31:0] x:R:G:B 8:8:8:8 little endian"
+    // -> bytes in increasing address order are B,G,R,X). Any other format
+    // falls back to this same assumption -- UNVERIFIED for anything else,
+    // and the first thing to check if colors come out wrong.
+    const int bpp = 4;
+    const bool knownFormat = (format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888);
+    if (!knownFormat) {
+        std::cerr << "renderFrame: unexpected buffer format 0x" << std::hex << format << std::dec
+                  << ", assuming XRGB8888 byte order anyway -- colors may be wrong\n";
+    }
+
+    // Stride: prefer whatever the buffer itself reports (padding/alignment
+    // is common and width*bpp isn't always right) -- only fall back to
+    // width*bpp if neither dmabuf() nor shm() report one. That fallback
+    // is a real, unverified guess; if the image comes out sheared
+    // diagonally, this is the line to check first.
+    int stride = width * bpp;
+    if (auto dmaAttrs = buffer->dmabuf(); dmaAttrs.success) {
+        stride = dmaAttrs.strides[0];
+    } else if (auto shmAttrs = buffer->shm(); shmAttrs.success) {
+        stride = shmAttrs.stride;
+    }
+
+    auto putPixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t* px = data + y * stride + x * bpp;
+        px[0] = b;
+        px[1] = g;
+        px[2] = r;
+        px[3] = 255;
+    };
+
+    // Clear to a dark background.
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            putPixel(x, y, 30, 30, 30);
+        }
+    }
+
+    // Draw each mapped window as a flat-colored rect at its camera-
+    // projected screen position. This is NOT the window's actual client
+    // content yet -- that needs reading the client's own surface buffer
+    // (WlSurfaceState::currentBuffer in src/wayland/Surface.hpp), which
+    // has its own separate format/stride/scaling concerns. This step only
+    // proves the output commit pipeline itself actually reaches the
+    // screen, which is the real point of doing this incrementally.
+    constexpr uint8_t kPalette[][3] = {
+        {70, 130, 180}, {180, 90, 70}, {90, 180, 90}, {170, 170, 60}, {150, 90, 180},
+    };
+    Vec2 viewport{static_cast<double>(width), static_cast<double>(height)};
+    int colorIndex = 0;
+
+    for (const auto& win : windows_) {
+        if (!win.mapped) continue;
+
+        Vec2 topLeft = camera_.worldToScreen(win.worldPosition, viewport);
+        Vec2 bottomRight = camera_.worldToScreen(win.worldPosition + win.size, viewport);
+
+        int x0 = std::clamp(static_cast<int>(topLeft.x), 0, width);
+        int y0 = std::clamp(static_cast<int>(topLeft.y), 0, height);
+        int x1 = std::clamp(static_cast<int>(bottomRight.x), 0, width);
+        int y1 = std::clamp(static_cast<int>(bottomRight.y), 0, height);
+
+        const auto& color = kPalette[colorIndex % (sizeof(kPalette) / sizeof(kPalette[0]))];
+        ++colorIndex;
+
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                putPixel(x, y, color[0], color[1], color[2]);
+            }
+        }
+    }
+
+    buffer->endDataPtr();
+
+    output.state->setBuffer(buffer);
+    output.state->setFormat(format);
+    if (!output.commit()) {
+        std::cerr << "renderFrame: commit failed, rolling back swapchain\n";
+        output.swapchain->rollback();
+    }
 }
 
 int Compositor::run() {

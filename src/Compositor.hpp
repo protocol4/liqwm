@@ -15,6 +15,9 @@
 #include <aquamarine/backend/Backend.hpp>
 #include <aquamarine/output/Output.hpp>
 #include <aquamarine/input/Input.hpp>
+#include <aquamarine/buffer/Buffer.hpp>
+#include <aquamarine/allocator/Allocator.hpp>
+#include <aquamarine/allocator/Swapchain.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
 #include <hyprutils/signal/Signal.hpp>
 #include <wayland-server-core.h>
